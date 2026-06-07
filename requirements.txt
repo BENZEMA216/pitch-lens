@@ -1,0 +1,20 @@
+# PitchLens — transcription dependencies
+# Core local stack (recommended: private, free, runs offline after first model download)
+funasr
+modelscope
+torch
+torchaudio
+
+# Optional — faster local English/multilingual fallback on Apple Silicon
+# mlx-whisper
+
+# Optional — speaker diarization fallback (only used if the ASR engine gives no speakers; needs HF_TOKEN)
+# pyannote.audio
+# huggingface-hub<1.0   # NOTE: pin <1.0 — hub 1.x breaks transformers/funasr at runtime
+
+# Optional — cloud ASR fallback (faster, but uploads audio; not for sensitive recordings)
+# groq          # Groq Whisper-large-v3
+# dashscope     # Alibaba SenseVoice (good for Chinese)
+
+# The analysis/report stage uses NO extra Python deps — it is done by an LLM
+# (e.g. Claude Code via the included skill, or any LLM with the rubric in docs/).

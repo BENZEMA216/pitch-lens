@@ -1,0 +1,38 @@
+# ─── NEVER commit private meeting data ───────────────────────────
+# recordings
+*.m4a
+*.mp3
+*.wav
+*.mp4
+*.aac
+*.aiff
+*.flac
+*.ogg
+# transcripts & their logs (per-recording outputs)
+*.transcript.md
+*.transcript.json
+*.transcript.log
+
+# pipeline run outputs (your real reports / logs live here)
+runs/*
+!runs/.gitkeep
+
+# secrets & local config
+.env
+config.yaml
+config.yml
+config.local.*
+*.secret
+.lark-cli/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.python-version
+
+# model / tool caches
+.cache/
+.DS_Store
