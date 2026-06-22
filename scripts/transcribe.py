@@ -2,29 +2,42 @@
 """
 transcribe.py — 把会议/对谈录音/视频（投资人/FA/客户/团队/访谈…）转成「带时间戳 + 说话人标签」的对话稿。
 
-本地优先，API 兜底。引擎选择顺序（--engine auto）：
-  funasr   本地，中文最强，含 VAD+标点+说话人分离(cam++)   ← 默认首选
-  mlx      本地 mlx-whisper（Apple Silicon），多语强，无说话人
-  groq     Groq Whisper-large-v3（API，需 GROQ_API_KEY），快，无说话人→可选 pyannote
-  dashscope 阿里 SenseVoice（API，需 DASHSCOPE_API_KEY），中文优化便宜
+本地优先，云端兜底（云端默认不开，需显式 --engine 或 --allow-cloud）。引擎选择顺序（--engine auto）：
+  funasr     本地，中文最强，含 VAD+标点+说话人分离(cam++)   ← 默认首选
+  mlx        本地 mlx-whisper（Apple Silicon），多语强，无说话人
+  groq       Groq Whisper-large-v3（API，需 GROQ_API_KEY），快，无说话人→可选 pyannote
+  dashscope  阿里 Paraformer（API，需 DASHSCOPE_API_KEY），中文优化便宜，无说话人
+  openrouter OpenRouter STT（API，需 OPENROUTER_API_KEY），可插拔多模型；**纯文本、无说话人分离**
+
+⚠️ 隐私：funasr/mlx 本地，录音不出本机；groq/dashscope/openrouter 会**上传音频到云端**。
+   因此 auto 默认只在本地引擎里选；要在 auto 里纳入云端，须加 --allow-cloud（每次云端调用前会显式告警）。
 
 用法:
   python3 transcribe.py 录音.m4a
   python3 transcribe.py 录音.mp4 --out 录音.transcript.md --engine funasr
-  python3 transcribe.py 录音.wav --engine groq            # 走 API
-  python3 transcribe.py 录音.m4a --no-diar                # 跳过说话人分离
+  python3 transcribe.py 录音.wav --engine openrouter            # 走 OpenRouter（纯文本，无分离）
+  python3 transcribe.py 录音.m4a --allow-cloud                  # 本地不可用时允许 auto 回退到云端
+  python3 transcribe.py 录音.m4a --no-diar                      # 跳过说话人分离
+  python3 transcribe.py 录音.mp4 --language en                  # 指定语种（默认 zh；auto=自动识别）
 
 输出: <name>.transcript.md（人读） + <name>.transcript.json（机读，毫秒时间戳+spk）
      + <name>.transcript.log（结构化日志：每阶段耗时、ETA、心跳）  ← v2 日志机制
+
+说话人分离：只有 funasr(cam++) 与 pyannote(需 HF_TOKEN) 路径会产出真实说话人；其余引擎 spk=None。
+若最终 < 2 位说话人，会**显式告警**——此时 talk-ratio / 分人语速 / 团队动态等客观信号不可计算，
+报告里相关面板应标 "N/A — 无说话人分离"，不要凭单桶文本编造客观信号。
 
 日志（解决"卡在结构化看不到进度"）：
 - 启动即打印音频时长 + 预计耗时(ETA, 本机 RTF≈0.35)。
 - 每个阶段(转码/模型加载/转录+分离/合成写出)单独计时。
 - 转录是单次阻塞调用 → 起一个**心跳线程**，每 HEARTBEAT_SEC 秒打印"已用Xs/预计Ys(Z%)"，证明没死。
 - 全程同时写到 stderr 和持久 .log 文件，可 `tail -f <name>.transcript.log` 实时看。
-环境变量：HEARTBEAT_SEC（默认 15）、TRANSCRIBE_RTF（默认 0.35）。
+环境变量：HEARTBEAT_SEC（默认 15）、TRANSCRIBE_RTF（默认 0.35）、
+         OPENROUTER_ASR_MODEL（默认 openai/whisper-large-v3，中文可设 qwen/qwen3-asr-flash）、
+         FFMPEG_BIN（手动指定 ffmpeg 路径）。
 """
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -35,9 +48,10 @@ import threading
 import time
 import wave
 
-FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+FFMPEG = shutil.which("ffmpeg") or os.getenv("FFMPEG_BIN")
 HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "15"))
 RTF = float(os.getenv("TRANSCRIBE_RTF", "0.35"))  # 本机实测 ~0.35×实时
+MERGE_GAP_SEC = 2.0  # 同说话人、间隔 < 此值的相邻段，在人读稿里合并（仅影响 .md 可读性）
 
 # ---------- 日志机制 ----------
 _T0 = time.time()
@@ -110,38 +124,60 @@ def fmt_ts(sec):
     return f"{sec // 60:02d}:{sec % 60:02d}"
 
 
+def _whisper_lang(lang):
+    """把 --language 归一成 whisper 系引擎的语种参数。默认中文优先；'auto' → None(自动识别)。"""
+    if not lang:
+        return "zh"
+    if lang == "auto":
+        return None
+    return lang
+
+
 def to_wav(src):
-    """ffmpeg → 16k 单声道 wav（所有引擎统一吃这个）。"""
-    if not (shutil.which("ffmpeg") or os.path.exists(FFMPEG)):
-        sys.exit("ffmpeg 未找到。brew install ffmpeg")
+    """ffmpeg → 16k 单声道 wav（所有引擎统一吃这个；云端分离也要求单声道）。"""
+    if not FFMPEG:
+        sys.exit("ffmpeg 未找到 / not found。安装：brew install ffmpeg（macOS）或 apt install ffmpeg（Linux），"
+                 "或设 FFMPEG_BIN 指向可执行文件。")
     fd, wav = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
-    with stage("① ffmpeg 转码 → 16k 单声道 wav"):
-        subprocess.run(
-            [FFMPEG, "-y", "-i", src, "-ac", "1", "-ar", "16000", "-vn", wav],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+    try:
+        with stage("① ffmpeg 转码 → 16k 单声道 wav"):
+            subprocess.run(
+                [FFMPEG, "-y", "-i", src, "-ac", "1", "-ar", "16000", "-vn", wav],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        try:
+            os.remove(wav)  # 转码失败别留下 0 字节临时文件
+        except OSError:
+            pass
+        raise
     return wav
 
 
 # ---------- 引擎实现：各返回 [{start, end, text, spk}]（秒；spk 可为 None） ----------
 
 def engine_available(name):
+    """本地引擎要求可 import；云端引擎要求 同时 有 key 且包已安装（避免 key 在但包没装 → 转码后才崩）。"""
     try:
         if name == "funasr":
-            __import__("funasr"); return True
+            return importlib.util.find_spec("funasr") is not None
         if name == "mlx":
-            __import__("mlx_whisper"); return True
+            return importlib.util.find_spec("mlx_whisper") is not None
         if name == "groq":
-            return bool(os.getenv("GROQ_API_KEY"))
+            return bool(os.getenv("GROQ_API_KEY")) and importlib.util.find_spec("groq") is not None
         if name == "dashscope":
-            return bool(os.getenv("DASHSCOPE_API_KEY"))
+            return bool(os.getenv("DASHSCOPE_API_KEY")) and importlib.util.find_spec("dashscope") is not None
+        if name == "openrouter":
+            return bool(os.getenv("OPENROUTER_API_KEY")) and importlib.util.find_spec("requests") is not None
     except Exception:
         return False
     return False
 
 
-def run_funasr(wav, diar=True):
+def run_funasr(wav, diar=True, lang=None, **_):
+    if lang and lang not in ("zh", "auto"):
+        log(f"⚠️  funasr 仅支持中文，已忽略 --language {lang}。")
     from funasr import AutoModel  # noqa
     with stage("② FunASR 模型加载（首次会下载到 ~/.cache/modelscope）"):
         kw = dict(model="paraformer-zh", vad_model="fsmn-vad", punc_model="ct-punc",
@@ -167,22 +203,24 @@ def run_funasr(wav, diar=True):
     return [s for s in out if s["text"]]
 
 
-def run_mlx(wav, **_):
+def run_mlx(wav, lang=None, **_):
     import mlx_whisper  # noqa
     r = mlx_whisper.transcribe(
-        wav, path_or_hf_repo="mlx-community/whisper-large-v3-mlx", language="zh",
-        verbose=False)
+        wav, path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
+        language=_whisper_lang(lang), verbose=False)
     return [{"start": s["start"], "end": s["end"], "text": s["text"].strip(), "spk": None}
             for s in r.get("segments", []) if s.get("text", "").strip()]
 
 
-def run_groq(wav, **_):
+def run_groq(wav, lang=None, **_):
     from groq import Groq  # noqa
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    lw = _whisper_lang(lang)
+    kw = dict(model="whisper-large-v3", response_format="verbose_json")
+    if lw:
+        kw["language"] = lw
     with open(wav, "rb") as f:
-        r = client.audio.transcriptions.create(
-            model="whisper-large-v3", file=f, language="zh",
-            response_format="verbose_json")
+        r = client.audio.transcriptions.create(file=f, **kw)
     segs = getattr(r, "segments", None) or (r.get("segments") if isinstance(r, dict) else [])
     out = []
     for s in segs:
@@ -191,8 +229,11 @@ def run_groq(wav, **_):
     return [s for s in out if s["text"]]
 
 
-def run_dashscope(wav, **_):
-    """阿里 DashScope SenseVoice。需 DASHSCOPE_API_KEY。"""
+def run_dashscope(wav, lang=None, **_):
+    """阿里 DashScope Paraformer。需 DASHSCOPE_API_KEY。
+    注意：当前用实时识别器(Recognition)做离线文件转写——对长录音不理想，且不返回说话人分离。
+    TODO（见 Base 改进项 P0/P2）：切到 Transcription.async_call(model='paraformer-v2',
+    diarization_enabled=True, speaker_count=<hint>) 以拿到原生说话人分离 + ms 时间戳。"""
     import dashscope  # noqa
     from dashscope.audio.asr import Recognition  # noqa
     dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -207,8 +248,45 @@ def run_dashscope(wav, **_):
     return [s for s in out if s["text"]]
 
 
-ENGINES = {"funasr": run_funasr, "mlx": run_mlx, "groq": run_groq, "dashscope": run_dashscope}
-AUTO_ORDER = ["funasr", "mlx", "groq", "dashscope"]
+def run_openrouter(wav, diar=True, lang=None, **_):
+    """OpenRouter STT（/audio/transcriptions，OpenAI 兼容）。需 OPENROUTER_API_KEY。
+    模型默认 openai/whisper-large-v3，可用 OPENROUTER_ASR_MODEL 覆盖（中文推荐 qwen/qwen3-asr-flash）。
+    ⚠️ 纯文本引擎：**不提供说话人分离**；时间戳取决于模型是否回 verbose_json 的 segments，
+       否则退化成单段。上游有 ~60s 超时，超长录音建议改用 funasr 或带分离的云端引擎。"""
+    import requests  # noqa
+    model = os.getenv("OPENROUTER_ASR_MODEL", "openai/whisper-large-v3")
+    lw = _whisper_lang(lang)
+    data = {"model": model, "response_format": "verbose_json"}
+    if lw:
+        data["language"] = lw
+    with open(wav, "rb") as f:
+        r = requests.post(
+            "https://openrouter.ai/api/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}"},
+            data=data, files={"file": ("audio.wav", f, "audio/wav")}, timeout=600)
+    r.raise_for_status()
+    j = r.json()
+    out = []
+    segs = j.get("segments") if isinstance(j, dict) else None
+    if segs:
+        for s in segs:
+            out.append({"start": s.get("start", 0), "end": s.get("end", 0),
+                        "text": (s.get("text") or "").strip(), "spk": None})
+    else:  # 端点只回 text → 退化成单段（无逐句时间戳）
+        txt = (j.get("text") if isinstance(j, dict) else str(j) or "").strip()
+        if txt:
+            out.append({"start": 0.0, "end": wav_duration(wav), "text": txt, "spk": None})
+    if diar:
+        log("⚠️  OpenRouter STT 不提供说话人分离：talk-ratio / 分人指标不可计算"
+            "（如需分离，设 HF_TOKEN 走 pyannote，或改用 funasr / 云端分离引擎）。")
+    return [s for s in out if s["text"]]
+
+
+ENGINES = {"funasr": run_funasr, "mlx": run_mlx, "groq": run_groq,
+           "dashscope": run_dashscope, "openrouter": run_openrouter}
+LOCAL_ENGINES = ["funasr", "mlx"]            # 录音不出本机
+CLOUD_ENGINES = ["groq", "dashscope", "openrouter"]  # 会上传音频到云端
+AUTO_ORDER = LOCAL_ENGINES + CLOUD_ENGINES   # 完整优先级；云端仅在 --allow-cloud 时纳入 auto
 
 
 def maybe_pyannote_diar(wav, segs):
@@ -244,6 +322,47 @@ def maybe_pyannote_diar(wav, segs):
     return segs
 
 
+def transcribe_with_fallback(wav, candidates, diar, lang=None):
+    """按 candidates 顺序逐个尝试；某引擎抛异常或返回空 → 记录并回退到下一个。
+    返回 (成功的引擎名, segs)；全部失败返回 (None, [])。"""
+    dur = wav_duration(wav)
+    last_err = None
+    for eng in candidates:
+        if eng in CLOUD_ENGINES:
+            log(f"⚠️  即将上传音频到云端（{eng}）——录音会离开本机。")
+        est = dur * RTF + (25 if eng == "funasr" else 5)  # +模型加载粗估
+        try:
+            with heartbeat(f"③ 转录[{eng}] + 说话人分离", est):
+                segs = ENGINES[eng](wav, diar=diar, lang=lang)
+                if diar:
+                    segs = maybe_pyannote_diar(wav, segs)
+            if segs:
+                return eng, segs
+            log(f"✗ 引擎 {eng} 返回空结果，尝试下一个候选…")
+        except Exception as e:
+            last_err = e
+            log(f"✗ 引擎 {eng} 失败：{e!r}；尝试下一个候选…")
+    if last_err:
+        log(f"所有候选引擎均失败，最后错误：{last_err!r}")
+    return None, []
+
+
+def merge_adjacent(segs):
+    """把相邻、同说话人、间隔 < MERGE_GAP_SEC 的段合并（仅为人读稿的可读性）。
+    不吞负间隔（乱序/重叠段），合并后 end 取 max 防止时间戳倒退。"""
+    merged = []
+    for s in segs:
+        gap = s["start"] - merged[-1]["end"] if merged else None
+        if merged and merged[-1]["speaker"] == s["speaker"] and gap is not None and 0 <= gap < MERGE_GAP_SEC:
+            tail = merged[-1]["text"]
+            sep = "" if tail.endswith(("。", "！", "？", ".", "!", "?")) else " "
+            merged[-1]["text"] = tail + sep + s["text"]
+            merged[-1]["end"] = max(merged[-1]["end"], s["end"])
+        else:
+            merged.append(dict(s))
+    return merged
+
+
 def normalize_spk(segs):
     """把任意 spk 标签映射成 Speaker 1/2/3…（按首次出现顺序）。"""
     mapping, n = {}, 0
@@ -260,18 +379,17 @@ def normalize_spk(segs):
 
 def write_outputs(segs, n_spk, src, out_md):
     base = os.path.splitext(out_md)[0]
-    merged = []
-    for s in segs:
-        if merged and merged[-1]["speaker"] == s["speaker"] and s["start"] - merged[-1]["end"] < 2:
-            merged[-1]["text"] += ("" if merged[-1]["text"].endswith(("。", "！", "？", ".", "!", "?")) else " ") + s["text"]
-            merged[-1]["end"] = s["end"]
-        else:
-            merged.append(dict(s))
+    merged = merge_adjacent(segs)
+    if n_spk >= 2:
+        spk_line = f"说话人数: {n_spk}"
+    else:
+        spk_line = ("说话人数: <2 ⚠️ 未获得说话人分离 → talk-ratio / 分人语速 / 团队动态 "
+                    "不可计算，报告相关面板请标 'N/A — 无说话人分离'")
     lines = [
         f"# Transcript — {os.path.basename(src)}",
         "",
         f"- 来源: `{src}`",
-        f"- 段数: {len(merged)}  说话人数: {n_spk if n_spk else '未分离'}",
+        f"- 段数: {len(merged)}  {spk_line}",
         "- speakers labeled Speaker N — who is founder/investor is decided in the analysis step",
         "",
         "---",
@@ -295,7 +413,11 @@ def main():
     ap.add_argument("audio")
     ap.add_argument("--out")
     ap.add_argument("--engine", default="auto",
-                    choices=["auto", "funasr", "mlx", "groq", "dashscope"])
+                    choices=["auto", "funasr", "mlx", "groq", "dashscope", "openrouter"])
+    ap.add_argument("--language", default="zh",
+                    help="语种（默认 zh；auto=自动识别；funasr 仅中文）")
+    ap.add_argument("--allow-cloud", action="store_true",
+                    help="允许 auto 在本地引擎不可用时回退到云端（会上传音频）")
     ap.add_argument("--no-diar", action="store_true")
     args = ap.parse_args()
 
@@ -314,30 +436,32 @@ def main():
     log(f"=== transcribe 开始 ===  源: {os.path.basename(src)}")
     log(f"日志文件: {logp}（可 `tail -f` 实时看）")
 
-    # 选引擎
+    # 选引擎 → 候选列表（auto 默认仅本地；--allow-cloud 才纳入云端）
     if args.engine == "auto":
-        chosen = next((e for e in AUTO_ORDER if engine_available(e)), None)
-        if not chosen:
+        pool = AUTO_ORDER if args.allow_cloud else LOCAL_ENGINES
+        candidates = [e for e in pool if engine_available(e)]
+        if not candidates:
+            extra = "" if args.allow_cloud else "\n或加 --allow-cloud 允许 auto 回退到云端引擎。"
             sys.exit(
-                "没有可用转录引擎。装本地栈：\n"
+                "没有可用的本地转录引擎。装本地栈：\n"
                 "  bash scripts/setup.sh\n"
-                "或走 API：export GROQ_API_KEY=... / export DASHSCOPE_API_KEY=...")
+                "或走云端（显式指定）：--engine groq|dashscope|openrouter\n"
+                "  export GROQ_API_KEY=... / DASHSCOPE_API_KEY=... / OPENROUTER_API_KEY=..."
+                + extra)
     else:
-        chosen = args.engine
-        if not engine_available(chosen):
-            sys.exit(f"引擎 {chosen} 不可用（未安装或缺 API key）。")
-    log(f"引擎 = {chosen}  说话人分离 = {'否' if args.no_diar else '是'}")
+        if not engine_available(args.engine):
+            sys.exit(f"引擎 {args.engine} 不可用（未安装或缺 API key）。")
+        candidates = [args.engine]  # 显式指定 = 严格，不回退
+
+    log(f"候选引擎 = {candidates}  说话人分离 = {'否' if args.no_diar else '是'}  语种 = {args.language}")
 
     wav = to_wav(src)
     dur = wav_duration(wav)
-    est = dur * RTF + (25 if chosen == "funasr" else 5)  # +模型加载粗估
     if dur:
+        est = dur * RTF + 25
         log(f"音频时长 {fmt_ts(dur)}（{dur/60:.1f} 分钟）→ 预计转录 ~{est/60:.1f} 分钟（RTF≈{RTF}）")
     try:
-        with heartbeat("③ 转录 + 说话人分离", est):
-            segs = ENGINES[chosen](wav, diar=not args.no_diar)
-            if not args.no_diar:
-                segs = maybe_pyannote_diar(wav, segs)
+        eng, segs = transcribe_with_fallback(wav, candidates, not args.no_diar, args.language)
     finally:
         try:
             os.remove(wav)
@@ -345,10 +469,15 @@ def main():
             pass
 
     if not segs:
-        sys.exit("转录结果为空。")
+        sys.exit("转录失败：所有候选引擎都没有产出结果。")
+    log(f"✓ 实际使用引擎 = {eng}")
+
     with stage("④ 合成（归并相邻同说话人 + 写文件）"):
         segs, n_spk = normalize_spk(segs)
         write_outputs(segs, n_spk, src, out_md)
+
+    if n_spk < 2:
+        log("⚠️  最终 < 2 位说话人：客观信号面板 / 团队动态不可计算；分析阶段相关章节应标 N/A。")
 
     total = time.time() - _T0
     real_rtf = total / dur if dur else 0

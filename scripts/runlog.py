@@ -106,12 +106,8 @@ def cmd_stage(a):
                   a.status, a.note or "")
 
 
-def cmd_ingest_transcribe(a):
-    """从 transcribe 的 .log 里抽 '总耗时 Xs' 和 '实际 RTF≈Y' 自动记一条 transcribe 阶段。"""
-    try:
-        txt = open(a.log, encoding="utf-8").read()
-    except Exception as e:
-        sys.exit(f"读不到 transcribe 日志: {e}")
+def _parse_transcribe_log(txt):
+    """从 transcribe 的 .log 文本里抽 (secs, note)：总耗时 / 实际 RTF / 段·人。纯函数，便于测试。"""
     m = re.search(r"总耗时\s*([0-9.]+)s", txt)
     secs = float(m.group(1)) if m else 0.0
     rtf = re.search(r"实际\s*RTF[≈~]?\s*([0-9.]+)", txt)
@@ -121,7 +117,17 @@ def cmd_ingest_transcribe(a):
         note.append(f"{seg.group(1)}段/{seg.group(2)}人")
     if rtf:
         note.append(f"RTF {rtf.group(1)}")
-    _record_stage(a.run_id, "transcribe", secs, "ok", " ".join(note))
+    return secs, " ".join(note)
+
+
+def cmd_ingest_transcribe(a):
+    """从 transcribe 的 .log 里抽 '总耗时 Xs' 和 '实际 RTF≈Y' 自动记一条 transcribe 阶段。"""
+    try:
+        txt = open(a.log, encoding="utf-8").read()
+    except Exception as e:
+        sys.exit(f"读不到 transcribe 日志: {e}")
+    secs, note = _parse_transcribe_log(txt)
+    _record_stage(a.run_id, "transcribe", secs, "ok", note)
 
 
 def cmd_done(a):

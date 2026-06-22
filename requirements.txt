@@ -14,7 +14,8 @@ torchaudio
 
 # Optional — cloud ASR fallback (faster, but uploads audio; not for sensitive recordings)
 # groq          # Groq Whisper-large-v3
-# dashscope     # Alibaba SenseVoice (good for Chinese)
+# dashscope     # Alibaba Paraformer (good for Chinese)
+# requests      # OpenRouter STT engine (pluggable multi-model; text-only, no diarization)
 
 # The analysis/report stage uses NO extra Python deps — it is done by an LLM
 # (e.g. Claude Code via the included skill, or any LLM with the rubric in docs/).

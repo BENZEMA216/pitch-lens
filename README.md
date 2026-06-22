@@ -69,18 +69,26 @@ recording / video / text
 ## Quickstart
 
 ```bash
-git clone <your-fork-url> pitch-lens && cd pitch-lens
+git clone https://github.com/BENZEMA216/pitch-lens.git && cd pitch-lens
+```
 
-# 1. Install the local transcription stack (private, free, offline after first run)
+**Already have a transcript?** (a Lark / Otter / Zoom export, or anything in `[mm:ss] Speaker N:` form) — skip transcription entirely: copy `skill/` into your agent (Step 3 below), paste the transcript, and say *"review this investor meeting"*. The analysis layer needs **no Python deps and no model download**. See [`examples/example-transcript.md`](examples/example-transcript.md) for the expected format.
+
+**Starting from raw audio?** Install the local transcription stack:
+
+```bash
+# Prereqs: Python 3 · ffmpeg (REQUIRED for all inputs) · ~3 GB free disk · Apple Silicon recommended.
 bash scripts/setup.sh          # installs funasr + torch (+ optional extras)
 
-# 2. Transcribe a recording  → meeting.transcript.md / .json / .log
+# Transcribe  → meeting.transcript.md / .json / .log   (local FunASR — nothing leaves your machine)
 python3 scripts/transcribe.py /path/to/meeting.m4a
 #   watch progress live (ETA + heartbeat) in another shell:
 #   tail -f /path/to/meeting.transcript.log
 ```
 
-First run downloads ~1–2 GB of models to `~/.cache/modelscope`. After that it's offline. Roughly **0.35× real‑time** on Apple Silicon (a 60‑min recording ≈ 20 min).
+First run downloads ~1–2 GB of models to `~/.cache/modelscope`. After that it's offline. Roughly **0.35× real‑time** on Apple Silicon (a 60‑min recording ≈ 20 min); slower on CPU.
+
+> **Cloud ASR is opt‑in.** `auto` mode uses only local engines (FunASR → mlx). Cloud engines (Groq / DashScope / OpenRouter) upload your audio and run **only** when you pass `--engine <name>` explicitly or add `--allow-cloud`; each cloud call prints an upload warning. Note: OpenRouter STT is text‑only (no speaker separation). Common issues: missing `ffmpeg` → `brew install ffmpeg`; a first‑run download that looks stalled → `tail -f *.transcript.log`.
 
 ### Step 3 — analyze
 
@@ -95,7 +103,7 @@ cp -r skill ~/.claude/skills/pitch-lens   # or wherever your agent loads skills
 ### Step 4 (optional) — publish & log
 
 - **Feishu/Lark:** turn each report into a shareable doc and keep a master index — see [`docs/feishu-integration.md`](docs/feishu-integration.md).
-- **Observability:** `scripts/runlog.py` records per‑run timings (transcription / analysis / publish / total) to `runs/logs/` so you can answer "how long did each stage take, on average?".
+- **Observability:** `scripts/runlog.py` records per‑run timings (transcribe / workflow / total) to `runs/logs/` so you can answer "how long did each stage take, on average?".
 
 ---
 
@@ -115,7 +123,11 @@ cp skill/reference/pitch-brief.template.md skill/reference/pitch-brief.md
 
 ## Privacy
 
-Fundraising recordings contain valuations, terms, and candid opinions. PitchLens is **local‑first by design** — transcription runs entirely on your machine (FunASR), nothing leaves it. Cloud ASR (Groq / DashScope) is **opt‑in** and clearly flagged. The `.gitignore` keeps recordings, transcripts, reports, and your pitch brief out of git.
+Fundraising recordings contain valuations, terms, and candid opinions. PitchLens is **local‑first by design** — `transcribe.py`'s `auto` mode uses only local engines (FunASR), so nothing leaves your machine.
+
+**Cloud ASR (Groq / DashScope / OpenRouter) uploads your audio** and runs only when you pass `--engine <name>` explicitly or add `--allow-cloud`; each cloud call prints an upload warning. Mind where the audio goes: Groq and OpenRouter are US‑hosted; Alibaba **DashScope runs on mainland‑CN infra** (relevant under PIPL for cross‑border fundraising data). Local FunASR is the only "nothing leaves your machine" path.
+
+`.gitignore` covers recordings, transcripts, `*.report.md`, your `pitch-brief.md`, and everything under `runs/` (where reports are saved by convention). A report saved elsewhere under a different name is **not** auto‑ignored — keep reports in `runs/` or name them `*.report.md`.
 
 ---
 
@@ -134,7 +146,7 @@ skill/
     pitch-brief.template.md      fill this with YOUR startup
 examples/                        a full synthetic transcript + report
 docs/
-  methodology.md                 the method, long form
+  methodology.md                 pointer → skill/reference/methodology.md (canonical method + citations)
   feishu-integration.md          optional: publish reports to Feishu/Lark
 runs/                            your transcripts, reports & logs land here (git‑ignored)
 ```
@@ -144,9 +156,9 @@ runs/                            your transcripts, reports & logs land here (git
 ## Credits
 
 The analysis method stands on published work on conversation intelligence and fundraising:
-Gong / Chorus (talk‑ratio, next‑steps, filler vs. hedging), MEDDIC, SPIN; NextView "VC Meeting Map", First Round, Paul Graham "How to Raise Money", Sequoia "How to Present", Michael Seibel / YC, a16z, Tomasz Tunguz; Mirabile / Belenzon on multi‑founder pitches; *Pyramid Principle*; *Executive Presence* (Hewlett). Full citations in [`docs/methodology.md`](docs/methodology.md).
+Gong / Chorus (talk‑ratio, next‑steps, filler vs. hedging), MEDDIC, SPIN; NextView "VC Meeting Map", First Round, Paul Graham "How to Raise Money", Sequoia "How to Present", Michael Seibel / YC, a16z, Tomasz Tunguz; Mirabile / Belenzon on multi‑founder pitches; *Pyramid Principle*; *Executive Presence* (Hewlett). Full citations in [`skill/reference/methodology.md`](skill/reference/methodology.md).
 
-Transcription: [FunASR](https://github.com/modelscope/FunASR) (Alibaba), with optional mlx‑whisper / Groq / DashScope.
+Transcription: [FunASR](https://github.com/modelscope/FunASR) (Alibaba, Paraformer + CAM++), with optional mlx‑whisper / Groq / Alibaba DashScope (Paraformer) / OpenRouter STT.
 
 ## License
 
