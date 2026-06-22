@@ -254,22 +254,30 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 OR_CHUNK_SEC = int(os.getenv("OPENROUTER_CHUNK_SEC", "120"))  # 长音频按此切片（上游响应有 ~60s 超时）
 
 
-def _openrouter_one(wav_path, model, lang):
-    """单段调用 OpenRouter STT：JSON body + base64(input_audio)，只回 text（无时间戳/分离）。"""
+def _openrouter_one(wav_path, model, lang, retries=3):
+    """单段调用 OpenRouter STT：JSON body + base64(input_audio)，只回 text（无时间戳/分离）。
+    对瞬时网络错误(SSL EOF / 超时 / 5xx)做有限重试，避免单片失败拖垮整条长录音。"""
     import requests  # noqa
     b64 = base64.b64encode(open(wav_path, "rb").read()).decode()
     body = {"model": model, "input_audio": {"data": b64, "format": "wav"}}
     lw = _whisper_lang(lang)
     if lw:
         body["language"] = lw
-    r = requests.post(
-        OPENROUTER_URL,
-        headers={"Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-                 "Content-Type": "application/json"},
-        json=body, timeout=180)
-    r.raise_for_status()
-    j = r.json()
-    return (j.get("text") or "").strip() if isinstance(j, dict) else ""
+    headers = {"Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+               "Content-Type": "application/json"}
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(OPENROUTER_URL, headers=headers, json=body, timeout=180)
+            r.raise_for_status()
+            j = r.json()
+            return (j.get("text") or "").strip() if isinstance(j, dict) else ""
+        except Exception as e:  # noqa
+            last = e
+            if attempt < retries:
+                log(f"    · 片段请求失败({attempt}/{retries})：{type(e).__name__}，2s 后重试…")
+                time.sleep(2)
+    raise last
 
 
 def run_openrouter(wav, diar=True, lang=None, **_):
