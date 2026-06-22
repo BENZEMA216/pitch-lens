@@ -37,8 +37,10 @@ transcribe.py — 把会议/对谈录音/视频（投资人/FA/客户/团队/访
          FFMPEG_BIN（手动指定 ffmpeg 路径）。
 """
 import argparse
+import base64
 import importlib.util
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -248,37 +250,64 @@ def run_dashscope(wav, lang=None, **_):
     return [s for s in out if s["text"]]
 
 
-def run_openrouter(wav, diar=True, lang=None, **_):
-    """OpenRouter STT（/audio/transcriptions，OpenAI 兼容）。需 OPENROUTER_API_KEY。
-    模型默认 openai/whisper-large-v3，可用 OPENROUTER_ASR_MODEL 覆盖（中文推荐 qwen/qwen3-asr-flash）。
-    ⚠️ 纯文本引擎：**不提供说话人分离**；时间戳取决于模型是否回 verbose_json 的 segments，
-       否则退化成单段。上游有 ~60s 超时，超长录音建议改用 funasr 或带分离的云端引擎。"""
+OPENROUTER_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+OR_CHUNK_SEC = int(os.getenv("OPENROUTER_CHUNK_SEC", "120"))  # 长音频按此切片（上游响应有 ~60s 超时）
+
+
+def _openrouter_one(wav_path, model, lang):
+    """单段调用 OpenRouter STT：JSON body + base64(input_audio)，只回 text（无时间戳/分离）。"""
     import requests  # noqa
-    model = os.getenv("OPENROUTER_ASR_MODEL", "openai/whisper-large-v3")
+    b64 = base64.b64encode(open(wav_path, "rb").read()).decode()
+    body = {"model": model, "input_audio": {"data": b64, "format": "wav"}}
     lw = _whisper_lang(lang)
-    data = {"model": model, "response_format": "verbose_json"}
     if lw:
-        data["language"] = lw
-    with open(wav, "rb") as f:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}"},
-            data=data, files={"file": ("audio.wav", f, "audio/wav")}, timeout=600)
+        body["language"] = lw
+    r = requests.post(
+        OPENROUTER_URL,
+        headers={"Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+                 "Content-Type": "application/json"},
+        json=body, timeout=180)
     r.raise_for_status()
     j = r.json()
+    return (j.get("text") or "").strip() if isinstance(j, dict) else ""
+
+
+def run_openrouter(wav, diar=True, lang=None, **_):
+    """OpenRouter STT（POST /audio/transcriptions，JSON+base64）。需 OPENROUTER_API_KEY。
+    模型默认 openai/gpt-4o-transcribe（中文最干净），可用 OPENROUTER_ASR_MODEL 覆盖
+    （openai/whisper-large-v3 更便宜；openai/whisper-large-v3-turbo 最快但易幻听）。
+    ⚠️ 该端点只回纯文本——**无说话人分离、无逐句时间戳**。长音频按 OPENROUTER_CHUNK_SEC 切片，
+       每片给一个粗粒度 [start,end] 时间窗（非逐句）。要真实分离请用 funasr 或 HF_TOKEN+pyannote。"""
+    model = os.getenv("OPENROUTER_ASR_MODEL", "openai/gpt-4o-transcribe")
+    dur = wav_duration(wav)
     out = []
-    segs = j.get("segments") if isinstance(j, dict) else None
-    if segs:
-        for s in segs:
-            out.append({"start": s.get("start", 0), "end": s.get("end", 0),
-                        "text": (s.get("text") or "").strip(), "spk": None})
-    else:  # 端点只回 text → 退化成单段（无逐句时间戳）
-        txt = (j.get("text") if isinstance(j, dict) else str(j) or "").strip()
+    if dur <= OR_CHUNK_SEC + 1:
+        txt = _openrouter_one(wav, model, lang)
         if txt:
-            out.append({"start": 0.0, "end": wav_duration(wav), "text": txt, "spk": None})
+            out.append({"start": 0.0, "end": dur or 0.0, "text": txt, "spk": None})
+    else:
+        n = math.ceil(dur / OR_CHUNK_SEC)
+        log(f"OpenRouter STT 分片：{dur:.0f}s → {n} 段 × {OR_CHUNK_SEC}s（模型 {model}）")
+        for i in range(n):
+            ss = i * OR_CHUNK_SEC
+            ee = min(ss + OR_CHUNK_SEC, dur)
+            chunk = f"{wav}.part{i}.wav"
+            subprocess.run([FFMPEG, "-y", "-ss", str(ss), "-t", str(OR_CHUNK_SEC), "-i", wav,
+                            "-ac", "1", "-ar", "16000", chunk],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                txt = _openrouter_one(chunk, model, lang)
+            finally:
+                try:
+                    os.remove(chunk)
+                except OSError:
+                    pass
+            if txt:
+                out.append({"start": float(ss), "end": float(ee), "text": txt, "spk": None})
+            log(f"  ✓ 片段 {i+1}/{n}（{fmt_ts(ss)}–{fmt_ts(ee)}）")
     if diar:
-        log("⚠️  OpenRouter STT 不提供说话人分离：talk-ratio / 分人指标不可计算"
-            "（如需分离，设 HF_TOKEN 走 pyannote，或改用 funasr / 云端分离引擎）。")
+        log("⚠️  OpenRouter STT 无说话人分离：talk-ratio / 分人指标不可计算"
+            "（如需分离，设 HF_TOKEN 走 pyannote，或改用 funasr / 带分离的云端引擎）。")
     return [s for s in out if s["text"]]
 
 
@@ -353,7 +382,10 @@ def merge_adjacent(segs):
     merged = []
     for s in segs:
         gap = s["start"] - merged[-1]["end"] if merged else None
-        if merged and merged[-1]["speaker"] == s["speaker"] and gap is not None and 0 <= gap < MERGE_GAP_SEC:
+        # never merge unknown speakers ("Speaker ?") — we can't claim they're the same person,
+        # and merging would collapse the only timestamps a no-diarization engine produces.
+        same_known = (merged and merged[-1]["speaker"] == s["speaker"] and s["speaker"] != "Speaker ?")
+        if same_known and gap is not None and 0 <= gap < MERGE_GAP_SEC:
             tail = merged[-1]["text"]
             sep = "" if tail.endswith(("。", "！", "？", ".", "!", "?")) else " "
             merged[-1]["text"] = tail + sep + s["text"]

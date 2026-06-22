@@ -88,6 +88,14 @@ def test_merge_punctuation_aware_join():
     assert merged[0]["text"] == "好。继续"  # no extra space after terminal punctuation
 
 
+def test_merge_never_collapses_unknown_speakers():
+    # no-diarization engines label every chunk "Speaker ?"; merging would lose chunk timestamps
+    segs = [_seg(0, 120, "a", "Speaker ?"), _seg(120, 240, "b", "Speaker ?")]
+    merged = T.merge_adjacent(segs)
+    assert len(merged) == 2
+    assert [m["start"] for m in merged] == [0, 120]
+
+
 # ---------- transcribe_with_fallback ----------
 def test_fallback_advances_past_failing_engine(monkeypatch):
     calls = []
