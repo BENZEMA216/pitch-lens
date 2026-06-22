@@ -31,7 +31,9 @@ recording / video / text
 python3 scripts/transcribe.py <audio/video> --out <name>.transcript.md
 # live progress (ETA + 15s heartbeat): tail -f <name>.transcript.log
 ```
-Engine auto-selects: local FunASR (best for Chinese, includes speaker diarization) → mlx-whisper → Groq API → DashScope. Local-first for privacy. If the user gives text/an existing transcript, skip ① → go to ②.
+Engine `auto` selects **local only** (FunASR → mlx-whisper) for privacy; cloud engines (Groq / DashScope / OpenRouter) upload audio and run only via explicit `--engine <name>` or `--allow-cloud`. **Only FunASR (cam++) and pyannote (`HF_TOKEN`) produce real speaker labels** — mlx/groq/dashscope/openrouter return none. Local-first for privacy. If the user gives text/an existing transcript, skip ① → go to ②.
+
+> **Diarization gate:** if the transcript header shows `说话人数 < 2` (no speaker separation), you **cannot** compute talk-ratio / per-speaker pace / talk-distribution. Stamp report §4 Objective panel and §6 Team dynamics as **"N/A — no speaker separation"** and do NOT invent those numbers. Re-run with FunASR (or set `HF_TOKEN` for pyannote) to get diarization.
 
 ### ② Classify (iron rule: classify BEFORE scoring)
 - **TYPE** by "who is being graded?" — you → A Investor; the counterparty selling advisory → B FA; both → C Hybrid; neither → D Other (lightweight summary only).
@@ -50,7 +52,7 @@ Engine auto-selects: local FunASR (best for Chinese, includes speaker diarizatio
 1. Classify TYPE + STAGE before scoring; stage picks the card.
 2. **Outcome first:** the top signal is a dated next step + who proposed it; temperature by actions, not words.
 3. **Fairness floor:** genuine engagement + no structural pass → floor 5.5–6, never invert.
-4. **Objective over vibes:** compute talk-ratio / monologue / pace / hedging; they're cross-meeting comparable.
+4. **Objective over vibes:** compute talk-ratio / monologue / pace / hedging; they're cross-meeting comparable — but they're **diarization- and ASR-derived proxies**, not ground truth. Require ≥2 reliable speakers (see the diarization gate); render them as supporting signals weighted alongside the action-based temperature, not standalone verdicts. (Thresholds like talk-ratio>65% are borrowed from B2B sales corpora and not yet validated for fundraising — see `methodology.md`.)
 5. Every claim gets a quote + timestamp; template sections never change → diff-able.
 6. Find the **real gating question** (the one behind the question); prep targets it.
 7. Save each report to `runs/<date>-<counterparty>.md` and keep an index for longitudinal comparison.

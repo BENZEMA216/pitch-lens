@@ -13,6 +13,12 @@
 *.transcript.json
 *.transcript.log
 
+# your filled-in startup brief (the *.template.md stays tracked — this is an exact name, not a glob)
+skill/reference/pitch-brief.md
+
+# generated reports written outside runs/ (the runs/<date>-<counterparty>.md convention is covered below)
+*.report.md
+
 # pipeline run outputs (your real reports / logs live here)
 runs/*
 !runs/.gitkeep
